@@ -1,7 +1,6 @@
 package eu.siacs.conversations.services;
 
 import android.util.Log;
-import android.util.Pair;
 
 import java.math.BigInteger;
 import java.util.ArrayList;
@@ -13,12 +12,16 @@ import eu.siacs.conversations.Config;
 import eu.siacs.conversations.R;
 import eu.siacs.conversations.entities.Account;
 import eu.siacs.conversations.entities.Conversation;
+import eu.siacs.conversations.entities.Conversational;
+import eu.siacs.conversations.entities.ReceiptRequest;
 import eu.siacs.conversations.generator.AbstractGenerator;
+import eu.siacs.conversations.xml.Namespace;
 import eu.siacs.conversations.xml.Element;
 import eu.siacs.conversations.xmpp.OnAdvancedStreamFeaturesLoaded;
-import eu.siacs.conversations.xmpp.OnIqPacketReceived;
-import eu.siacs.conversations.xmpp.jid.Jid;
+import eu.siacs.conversations.xmpp.mam.MamReference;
 import eu.siacs.conversations.xmpp.stanzas.IqPacket;
+import eu.siacs.conversations.xmpp.stanzas.MessagePacket;
+import rocks.xmpp.addr.Jid;
 
 public class MessageArchiveService implements OnAdvancedStreamFeaturesLoaded {
 
@@ -27,92 +30,187 @@ public class MessageArchiveService implements OnAdvancedStreamFeaturesLoaded {
 	private final HashSet<Query> queries = new HashSet<>();
 	private final ArrayList<Query> pendingQueries = new ArrayList<>();
 
-	public enum PagingOrder {
-		NORMAL,
-		REVERSE
-	}
+	public enum Version {
+		MAM_0("urn:xmpp:mam:0", true),
+		MAM_1("urn:xmpp:mam:1", false),
+		MAM_2("urn:xmpp:mam:2", false);
 
-	public MessageArchiveService(final XmppConnectionService service) {
+		public final boolean legacy;
+		public final String namespace;
+
+		Version(String namespace, boolean legacy) {
+			this.namespace = namespace;
+			this.legacy = legacy;
+		}
+
+		public static Version get(Account account) {
+			return get(account,null);
+		}
+
+		public static Version get(Account account, Conversation conversation) {
+			if (conversation == null || conversation.getMode() == Conversation.MODE_SINGLE) {
+				return get(account.getXmppConnection().getFeatures().getAccountFeatures());
+			} else {
+				return get(conversation.getMucOptions().getFeatures());
+			}
+		}
+
+		private static Version get(List<String> features) {
+			final Version[] values = values();
+			for(int i = values.length -1; i >= 0; --i) {
+				for(String feature : features) {
+					if (values[i].namespace.equals(feature)) {
+						return values[i];
+					}
+				}
+			}
+			return MAM_0;
+		}
+
+		public static boolean has(List<String> features) {
+			for(String feature : features) {
+				for(Version version : values()) {
+					if (version.namespace.equals(feature)) {
+						return true;
+					}
+				}
+			}
+			return false;
+		}
+
+		public static Element findResult(MessagePacket packet) {
+			for(Version version : values()) {
+				Element result = packet.findChild("result", version.namespace);
+				if (result != null) {
+					return result;
+				}
+			}
+			return null;
+		}
+
+	};
+
+	MessageArchiveService(final XmppConnectionService service) {
 		this.mXmppConnectionService = service;
 	}
 
 	private void catchup(final Account account) {
 		synchronized (this.queries) {
-			for(Iterator<Query> iterator = this.queries.iterator(); iterator.hasNext();) {
+			for (Iterator<Query> iterator = this.queries.iterator(); iterator.hasNext(); ) {
 				Query query = iterator.next();
 				if (query.getAccount() == account) {
 					iterator.remove();
 				}
 			}
 		}
-		long startCatchup = getLastMessageTransmitted(account);
+		MamReference mamReference = MamReference.max(
+				mXmppConnectionService.databaseBackend.getLastMessageReceived(account),
+				mXmppConnectionService.databaseBackend.getLastClearDate(account)
+		);
+		mamReference = MamReference.max(mamReference, mXmppConnectionService.getAutomaticMessageDeletionDate());
 		long endCatchup = account.getXmppConnection().getLastSessionEstablished();
-		if (startCatchup == 0) {
+		final Query query;
+		if (mamReference.getTimestamp() == 0) {
 			return;
-		} else if (endCatchup - startCatchup >= Config.MAM_MAX_CATCHUP) {
-			startCatchup = endCatchup - Config.MAM_MAX_CATCHUP;
+		} else if (endCatchup - mamReference.getTimestamp() >= Config.MAM_MAX_CATCHUP) {
+			long startCatchup = endCatchup - Config.MAM_MAX_CATCHUP;
 			List<Conversation> conversations = mXmppConnectionService.getConversations();
 			for (Conversation conversation : conversations) {
-				if (conversation.getMode() == Conversation.MODE_SINGLE && conversation.getAccount() == account && startCatchup > conversation.getLastMessageTransmitted()) {
-					this.query(conversation,startCatchup);
+				if (conversation.getMode() == Conversation.MODE_SINGLE && conversation.getAccount() == account && startCatchup > conversation.getLastMessageTransmitted().getTimestamp()) {
+					this.query(conversation, startCatchup, true);
 				}
 			}
+			query = new Query(account, new MamReference(startCatchup), 0);
+		} else {
+			query = new Query(account, mamReference, 0);
 		}
-		final Query query = new Query(account, startCatchup, endCatchup);
-		this.queries.add(query);
+		synchronized (this.queries) {
+			this.queries.add(query);
+		}
 		this.execute(query);
 	}
 
-	public void catchupMUC(final Conversation conversation) {
-		if (conversation.getLastMessageTransmitted() < 0 && conversation.countMessages() == 0) {
+	void catchupMUC(final Conversation conversation) {
+		if (conversation.getLastMessageTransmitted().getTimestamp() < 0 && conversation.countMessages() == 0) {
 			query(conversation,
+					new MamReference(0),
 					0,
-					System.currentTimeMillis());
+					true);
 		} else {
 			query(conversation,
 					conversation.getLastMessageTransmitted(),
-					System.currentTimeMillis());
+					0,
+					true);
 		}
-	}
-
-	private long getLastMessageTransmitted(final Account account) {
-		Pair<Long,String> pair = mXmppConnectionService.databaseBackend.getLastMessageReceived(account);
-		return pair == null ? 0 : pair.first;
 	}
 
 	public Query query(final Conversation conversation) {
-		if (conversation.getLastMessageTransmitted() < 0 && conversation.countMessages() == 0) {
+		if (conversation.getLastMessageTransmitted().getTimestamp() < 0 && conversation.countMessages() == 0) {
 			return query(conversation,
-					0,
-					System.currentTimeMillis());
+					new MamReference(0),
+					System.currentTimeMillis(),
+					false);
 		} else {
 			return query(conversation,
 					conversation.getLastMessageTransmitted(),
-					conversation.getAccount().getXmppConnection().getLastSessionEstablished());
+					conversation.getAccount().getXmppConnection().getLastSessionEstablished(),
+					false);
 		}
 	}
 
-	public Query query(final Conversation conversation, long end) {
-		return this.query(conversation,conversation.getLastMessageTransmitted(),end);
+	public boolean isCatchingUp(Conversation conversation) {
+		final Account account = conversation.getAccount();
+		if (account.getXmppConnection().isWaitingForSmCatchup()) {
+			return true;
+		} else {
+			synchronized (this.queries) {
+				for (Query query : this.queries) {
+					if (query.getAccount() == account && query.isCatchup() && ((conversation.getMode() == Conversation.MODE_SINGLE && query.getWith() == null) || query.getConversation() == conversation)) {
+						return true;
+					}
+				}
+			}
+			return false;
+		}
 	}
 
-	public Query query(Conversation conversation, long start, long end) {
+	public Query query(final Conversation conversation, long end, boolean allowCatchup) {
+		return this.query(conversation, conversation.getLastMessageTransmitted(), end, allowCatchup);
+	}
+
+	public Query query(Conversation conversation, MamReference start, long end, boolean allowCatchup) {
 		synchronized (this.queries) {
-			if (start > end) {
+			final Query query;
+			final MamReference startActual = MamReference.max(start, mXmppConnectionService.getAutomaticMessageDeletionDate());
+			if (start.getTimestamp() == 0) {
+				query = new Query(conversation, startActual, end, false);
+				query.reference = conversation.getFirstMamReference();
+			} else {
+				if (allowCatchup) {
+					MamReference maxCatchup = MamReference.max(startActual, System.currentTimeMillis() - Config.MAM_MAX_CATCHUP);
+					if (maxCatchup.greaterThan(startActual)) {
+						Query reverseCatchup = new Query(conversation, startActual, maxCatchup.getTimestamp(), false);
+						this.queries.add(reverseCatchup);
+						this.execute(reverseCatchup);
+					}
+					query = new Query(conversation, maxCatchup, end, true);
+				} else {
+					query = new Query(conversation, startActual, end, false);
+				}
+			}
+			if (end != 0 && start.greaterThan(end)) {
 				return null;
 			}
-			final Query query = new Query(conversation, start, end,PagingOrder.REVERSE);
-			query.reference = conversation.getFirstMamReference();
 			this.queries.add(query);
 			this.execute(query);
 			return query;
 		}
 	}
 
-	public void executePendingQueries(final Account account) {
+	void executePendingQueries(final Account account) {
 		List<Query> pending = new ArrayList<>();
-		synchronized(this.pendingQueries) {
-			for(Iterator<Query> iterator = this.pendingQueries.iterator(); iterator.hasNext();) {
+		synchronized (this.pendingQueries) {
+			for (Iterator<Query> iterator = this.pendingQueries.iterator(); iterator.hasNext(); ) {
 				Query query = iterator.next();
 				if (query.getAccount() == account) {
 					pending.add(query);
@@ -120,30 +218,32 @@ public class MessageArchiveService implements OnAdvancedStreamFeaturesLoaded {
 				}
 			}
 		}
-		for(Query query : pending) {
+		for (Query query : pending) {
 			this.execute(query);
 		}
 	}
 
 	private void execute(final Query query) {
-		final Account account=  query.getAccount();
+		final Account account = query.getAccount();
 		if (account.getStatus() == Account.State.ONLINE) {
-			Log.d(Config.LOGTAG, account.getJid().toBareJid().toString() + ": running mam query " + query.toString());
+			Log.d(Config.LOGTAG, account.getJid().asBareJid().toString() + ": running mam query " + query.toString());
 			IqPacket packet = this.mXmppConnectionService.getIqGenerator().queryMessageArchiveManagement(query);
-			this.mXmppConnectionService.sendIqPacket(account, packet, new OnIqPacketReceived() {
-				@Override
-				public void onIqPacketReceived(Account account, IqPacket packet) {
-					if (packet.getType() == IqPacket.TYPE.TIMEOUT) {
-						synchronized (MessageArchiveService.this.queries) {
-							MessageArchiveService.this.queries.remove(query);
-							if (query.hasCallback()) {
-								query.callback(false);
-							}
+			this.mXmppConnectionService.sendIqPacket(account, packet, (a, p) -> {
+				Element fin = p.findChild("fin", query.version.namespace);
+				if (p.getType() == IqPacket.TYPE.TIMEOUT) {
+					synchronized (MessageArchiveService.this.queries) {
+						MessageArchiveService.this.queries.remove(query);
+						if (query.hasCallback()) {
+							query.callback(false);
 						}
-					} else if (packet.getType() != IqPacket.TYPE.RESULT) {
-						Log.d(Config.LOGTAG, account.getJid().toBareJid().toString() + ": error executing mam: " + packet.toString());
-						finalizeQuery(query, true);
 					}
+				} else if (p.getType() == IqPacket.TYPE.RESULT && fin != null) {
+					processFin(query, fin);
+				} else if (p.getType() == IqPacket.TYPE.RESULT && query.isLegacy()) {
+					//do nothing
+				} else {
+					Log.d(Config.LOGTAG, a.getJid().asBareJid().toString() + ": error executing mam: " + p.toString());
+					finalizeQuery(query, true);
 				}
 			});
 		} else {
@@ -162,7 +262,7 @@ public class MessageArchiveService implements OnAdvancedStreamFeaturesLoaded {
 			conversation.sort();
 			conversation.setHasMessagesLeftOnServer(!done);
 		} else {
-			for(Conversation tmp : this.mXmppConnectionService.getConversations()) {
+			for (Conversation tmp : this.mXmppConnectionService.getConversations()) {
 				if (tmp.getAccount() == query.getAccount()) {
 					tmp.sort();
 				}
@@ -175,9 +275,34 @@ public class MessageArchiveService implements OnAdvancedStreamFeaturesLoaded {
 		}
 	}
 
-	public boolean queryInProgress(Conversation conversation, XmppConnectionService.OnMoreMessagesLoaded callback) {
+	boolean inCatchup(Account account) {
+		synchronized (this.queries) {
+			for (Query query : queries) {
+				if (query.account == account && query.isCatchup() && query.getWith() == null) {
+					return true;
+				}
+			}
+		}
+		return false;
+	}
+
+	public boolean isCatchupInProgress(Conversation conversation) {
 		synchronized (this.queries) {
 			for(Query query : queries) {
+				if (query.account == conversation.getAccount() && query.isCatchup()) {
+					final Jid with = query.getWith() == null ? null : query.getWith().asBareJid();
+					if ((conversation.getMode() == Conversational.MODE_SINGLE && with == null) || (conversation.getJid().asBareJid().equals(with))) {
+						return true;
+					}
+				}
+			}
+		}
+		return false;
+	}
+
+	boolean queryInProgress(Conversation conversation, XmppConnectionService.OnMoreMessagesLoaded callback) {
+		synchronized (this.queries) {
+			for (Query query : queries) {
 				if (query.conversation == conversation) {
 					if (!query.hasCallback() && callback != null) {
 						query.setCallback(callback);
@@ -193,30 +318,48 @@ public class MessageArchiveService implements OnAdvancedStreamFeaturesLoaded {
 		return queryInProgress(conversation, null);
 	}
 
-	public void processFin(Element fin, Jid from) {
-		if (fin == null) {
-			return;
-		}
+	public void processFinLegacy(Element fin, Jid from) {
 		Query query = findQuery(fin.getAttribute("queryid"));
-		if (query == null || !query.validFrom(from)) {
-			return;
+		if (query != null && query.validFrom(from)) {
+			processFin(query, fin);
 		}
+	}
+
+	private void processFin(Query query, Element fin) {
 		boolean complete = fin.getAttributeAsBoolean("complete");
-		Element set = fin.findChild("set","http://jabber.org/protocol/rsm");
+		Element set = fin.findChild("set", "http://jabber.org/protocol/rsm");
 		Element last = set == null ? null : set.findChild("last");
+		String count = set == null ? null : set.findChildContent("count");
 		Element first = set == null ? null : set.findChild("first");
 		Element relevant = query.getPagingOrder() == PagingOrder.NORMAL ? last : first;
-		boolean abort = (query.getStart() == 0 && query.getTotalCount() >= Config.PAGE_SIZE) || query.getTotalCount() >= Config.MAM_MAX_MESSAGES;
+		boolean abort = (!query.isCatchup() && query.getTotalCount() >= Config.PAGE_SIZE) || query.getTotalCount() >= Config.MAM_MAX_MESSAGES;
 		if (query.getConversation() != null) {
 			query.getConversation().setFirstMamReference(first == null ? null : first.getContent());
 		}
 		if (complete || relevant == null || abort) {
-			final boolean done = (complete || query.getMessageCount() == 0) && query.getStart() == 0;
-			this.finalizeQuery(query, done);
-			Log.d(Config.LOGTAG,query.getAccount().getJid().toBareJid()+": finished mam after "+query.getTotalCount()+" messages. messages left="+Boolean.toString(!done));
-			if (query.getWith() == null && query.getMessageCount() > 0) {
-				mXmppConnectionService.getNotificationService().finishBacklog(true);
+			//TODO: FIX done logic to look at complete. using count is probably unreliable because it can be ommited and doesn’t work with paging.
+			boolean done;
+			if (query.isCatchup()) {
+				done = false;
+			} else {
+				if (count != null) {
+					try {
+						done = Integer.parseInt(count) <= query.getTotalCount();
+					} catch (NumberFormatException e) {
+						done = false;
+					}
+				} else {
+					done = query.getTotalCount() == 0;
+				}
 			}
+			done = done || (query.getActualMessageCount() == 0 && !query.isCatchup());
+			this.finalizeQuery(query, done);
+
+			Log.d(Config.LOGTAG, query.getAccount().getJid().asBareJid() + ": finished mam after " + query.getTotalCount() + "(" + query.getActualMessageCount() + ") messages. messages left=" + Boolean.toString(!done) + " count=" + count);
+			if (query.isCatchup() && query.getActualMessageCount() > 0) {
+				mXmppConnectionService.getNotificationService().finishBacklog(true, query.getAccount());
+			}
+			processPostponed(query);
 		} else {
 			final Query nextQuery;
 			if (query.getPagingOrder() == PagingOrder.NORMAL) {
@@ -232,12 +375,48 @@ public class MessageArchiveService implements OnAdvancedStreamFeaturesLoaded {
 		}
 	}
 
+	void kill(Conversation conversation) {
+		final ArrayList<Query> toBeKilled = new ArrayList<>();
+		synchronized (this.queries) {
+			for (Query q : queries) {
+				if (q.conversation == conversation) {
+					toBeKilled.add(q);
+				}
+			}
+		}
+		for (Query q : toBeKilled) {
+			kill(q);
+		}
+	}
+
+	private void kill(Query query) {
+		Log.d(Config.LOGTAG, query.getAccount().getJid().asBareJid() + ": killing mam query prematurely");
+		query.callback = null;
+		this.finalizeQuery(query, false);
+		if (query.isCatchup() && query.getActualMessageCount() > 0) {
+			mXmppConnectionService.getNotificationService().finishBacklog(true, query.getAccount());
+		}
+		this.processPostponed(query);
+	}
+
+	private void processPostponed(Query query) {
+		query.account.getAxolotlService().processPostponed();
+		query.pendingReceiptRequests.removeAll(query.receiptRequests);
+		Log.d(Config.LOGTAG, query.getAccount().getJid().asBareJid() + ": found " + query.pendingReceiptRequests.size() + " pending receipt requests");
+		Iterator<ReceiptRequest> iterator = query.pendingReceiptRequests.iterator();
+		while (iterator.hasNext()) {
+			ReceiptRequest rr = iterator.next();
+			mXmppConnectionService.sendMessagePacket(query.account, mXmppConnectionService.getMessageGenerator().received(query.account, rr.getJid(), rr.getId()));
+			iterator.remove();
+		}
+	}
+
 	public Query findQuery(String id) {
 		if (id == null) {
 			return null;
 		}
 		synchronized (this.queries) {
-			for(Query query : this.queries) {
+			for (Query query : this.queries) {
 				if (query.getQueryId().equals(id)) {
 					return query;
 				}
@@ -253,9 +432,17 @@ public class MessageArchiveService implements OnAdvancedStreamFeaturesLoaded {
 		}
 	}
 
+	public enum PagingOrder {
+		NORMAL,
+		REVERSE
+	}
+
 	public class Query {
+		private HashSet<ReceiptRequest> pendingReceiptRequests = new HashSet<>();
+		private HashSet<ReceiptRequest> receiptRequests = new HashSet<>();
 		private int totalCount = 0;
-		private int messageCount = 0;
+		private int actualCount = 0;
+		private int actualInThisQuery = 0;
 		private long start;
 		private long end;
 		private String queryId;
@@ -264,32 +451,61 @@ public class MessageArchiveService implements OnAdvancedStreamFeaturesLoaded {
 		private Conversation conversation;
 		private PagingOrder pagingOrder = PagingOrder.NORMAL;
 		private XmppConnectionService.OnMoreMessagesLoaded callback = null;
+		private boolean catchup = true;
+		public final Version version;
 
 
-		public Query(Conversation conversation, long start, long end) {
-			this(conversation.getAccount(), start, end);
+		Query(Conversation conversation, MamReference start, long end, boolean catchup) {
+			this(conversation.getAccount(), Version.get(conversation.getAccount(), conversation), catchup ? start : start.timeOnly(), end);
 			this.conversation = conversation;
+			this.pagingOrder = catchup ? PagingOrder.NORMAL : PagingOrder.REVERSE;
+			this.catchup = catchup;
 		}
 
-		public Query(Conversation conversation, long start, long end, PagingOrder order) {
-			this(conversation,start,end);
-			this.pagingOrder = order;
+		Query(Account account, MamReference start, long end) {
+			this(account, Version.get(account), start, end);
 		}
 
-		public Query(Account account, long start, long end) {
+		Query(Account account, Version version, MamReference start, long end) {
 			this.account = account;
-			this.start = start;
+			if (start.getReference() != null) {
+				this.reference = start.getReference();
+			} else {
+				this.start = start.getTimestamp();
+			}
 			this.end = end;
 			this.queryId = new BigInteger(50, mXmppConnectionService.getRNG()).toString(32);
+			this.version = version;
 		}
 
 		private Query page(String reference) {
-			Query query = new Query(this.account,this.start,this.end);
-			query.reference = reference;
+			Query query = new Query(this.account, this.version, new MamReference(this.start, reference), this.end);
 			query.conversation = conversation;
 			query.totalCount = totalCount;
+			query.actualCount = actualCount;
+			query.pendingReceiptRequests = pendingReceiptRequests;
+			query.receiptRequests = receiptRequests;
 			query.callback = callback;
+			query.catchup = catchup;
 			return query;
+		}
+
+		public void removePendingReceiptRequest(ReceiptRequest receiptRequest) {
+			if (!this.pendingReceiptRequests.remove(receiptRequest)) {
+				this.receiptRequests.add(receiptRequest);
+			}
+		}
+
+		public void addPendingReceiptRequest(ReceiptRequest receiptRequest) {
+			this.pendingReceiptRequests.add(receiptRequest);
+		}
+
+		public boolean isLegacy() {
+			return version.legacy;
+		}
+
+		public boolean safeToExtractTrueCounterpart() {
+			return muc() && !isLegacy();
 		}
 
 		public Query next(String reference) {
@@ -298,7 +514,7 @@ public class MessageArchiveService implements OnAdvancedStreamFeaturesLoaded {
 			return query;
 		}
 
-		public Query prev(String reference) {
+		Query prev(String reference) {
 			Query query = page(reference);
 			query.pagingOrder = PagingOrder.REVERSE;
 			return query;
@@ -317,7 +533,7 @@ public class MessageArchiveService implements OnAdvancedStreamFeaturesLoaded {
 		}
 
 		public Jid getWith() {
-			return conversation == null ? null : conversation.getJid().toBareJid();
+			return conversation == null ? null : conversation.getJid().asBareJid();
 		}
 
 		public boolean muc() {
@@ -328,13 +544,17 @@ public class MessageArchiveService implements OnAdvancedStreamFeaturesLoaded {
 			return start;
 		}
 
+		public boolean isCatchup() {
+			return catchup;
+		}
+
 		public void setCallback(XmppConnectionService.OnMoreMessagesLoaded callback) {
 			this.callback = callback;
 		}
 
 		public void callback(boolean done) {
 			if (this.callback != null) {
-				this.callback.onMoreMessagesLoaded(messageCount,conversation);
+				this.callback.onMoreMessagesLoaded(actualCount, conversation);
 				if (done) {
 					this.callback.informUser(R.string.no_more_history_on_server);
 				}
@@ -354,23 +574,31 @@ public class MessageArchiveService implements OnAdvancedStreamFeaturesLoaded {
 		}
 
 		public void incrementMessageCount() {
-			this.messageCount++;
 			this.totalCount++;
 		}
 
-		public int getTotalCount() {
+		public void incrementActualMessageCount() {
+			this.actualInThisQuery++;
+			this.actualCount++;
+		}
+
+		int getTotalCount() {
 			return this.totalCount;
 		}
 
-		public int getMessageCount() {
-			return this.messageCount;
+		int getActualMessageCount() {
+			return this.actualCount;
+		}
+
+		public int getActualInThisQuery() {
+			return this.actualInThisQuery;
 		}
 
 		public boolean validFrom(Jid from) {
 			if (muc()) {
 				return getWith().equals(from);
 			} else {
-				return (from == null) || account.getJid().toBareJid().equals(from.toBareJid());
+				return (from == null) || account.getJid().asBareJid().equals(from.asBareJid());
 			}
 		}
 
@@ -388,11 +616,16 @@ public class MessageArchiveService implements OnAdvancedStreamFeaturesLoaded {
 					builder.append(getWith().toString());
 				}
 			}
-			builder.append(", start=");
-			builder.append(AbstractGenerator.getTimestamp(this.start));
-			builder.append(", end=");
-			builder.append(AbstractGenerator.getTimestamp(this.end));
-			if (this.reference!=null) {
+			if (this.start != 0) {
+				builder.append(", start=");
+				builder.append(AbstractGenerator.getTimestamp(this.start));
+			}
+			if (this.end != 0) {
+				builder.append(", end=");
+				builder.append(AbstractGenerator.getTimestamp(this.end));
+			}
+			builder.append(", order=").append(pagingOrder.toString());
+			if (this.reference != null) {
 				if (this.pagingOrder == PagingOrder.NORMAL) {
 					builder.append(", after=");
 				} else {
@@ -400,10 +633,12 @@ public class MessageArchiveService implements OnAdvancedStreamFeaturesLoaded {
 				}
 				builder.append(this.reference);
 			}
+			builder.append(", catchup=").append(Boolean.toString(catchup));
+			builder.append(", ns=").append(version.namespace);
 			return builder.toString();
 		}
 
-		public boolean hasCallback() {
+		boolean hasCallback() {
 			return this.callback != null;
 		}
 	}

@@ -3,27 +3,29 @@ package eu.siacs.conversations.crypto.axolotl;
 import android.util.Log;
 import android.util.LruCache;
 
-import org.whispersystems.libaxolotl.AxolotlAddress;
-import org.whispersystems.libaxolotl.IdentityKey;
-import org.whispersystems.libaxolotl.IdentityKeyPair;
-import org.whispersystems.libaxolotl.InvalidKeyIdException;
-import org.whispersystems.libaxolotl.ecc.Curve;
-import org.whispersystems.libaxolotl.ecc.ECKeyPair;
-import org.whispersystems.libaxolotl.state.AxolotlStore;
-import org.whispersystems.libaxolotl.state.PreKeyRecord;
-import org.whispersystems.libaxolotl.state.SessionRecord;
-import org.whispersystems.libaxolotl.state.SignedPreKeyRecord;
-import org.whispersystems.libaxolotl.util.KeyHelper;
+import org.whispersystems.libsignal.SignalProtocolAddress;
+import org.whispersystems.libsignal.IdentityKey;
+import org.whispersystems.libsignal.IdentityKeyPair;
+import org.whispersystems.libsignal.InvalidKeyIdException;
+import org.whispersystems.libsignal.ecc.Curve;
+import org.whispersystems.libsignal.ecc.ECKeyPair;
+import org.whispersystems.libsignal.state.SignalProtocolStore;
+import org.whispersystems.libsignal.state.PreKeyRecord;
+import org.whispersystems.libsignal.state.SessionRecord;
+import org.whispersystems.libsignal.state.SignedPreKeyRecord;
+import org.whispersystems.libsignal.util.KeyHelper;
 
 import java.security.cert.X509Certificate;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
 
 import eu.siacs.conversations.Config;
 import eu.siacs.conversations.entities.Account;
 import eu.siacs.conversations.services.XmppConnectionService;
+import eu.siacs.conversations.utils.CryptoHelper;
 
-public class SQLiteAxolotlStore implements AxolotlStore {
+public class SQLiteAxolotlStore implements SignalProtocolStore {
 
 	public static final String PREKEY_TABLENAME = "prekeys";
 	public static final String SIGNED_PREKEY_TABLENAME = "signed_prekeys";
@@ -35,7 +37,10 @@ public class SQLiteAxolotlStore implements AxolotlStore {
 	public static final String KEY = "key";
 	public static final String FINGERPRINT = "fingerprint";
 	public static final String NAME = "name";
-	public static final String TRUSTED = "trusted";
+	public static final String TRUSTED = "trusted"; //no longer used
+	public static final String TRUST = "trust";
+	public static final String ACTIVE = "active";
+	public static final String LAST_ACTIVATION = "last_activation";
 	public static final String OWN = "ownkey";
 	public static final String CERTIFICATE = "certificate";
 
@@ -51,11 +56,13 @@ public class SQLiteAxolotlStore implements AxolotlStore {
 	private int localRegistrationId;
 	private int currentPreKeyId = 0;
 
-	private final LruCache<String, XmppAxolotlSession.Trust> trustCache =
-			new LruCache<String, XmppAxolotlSession.Trust>(NUM_TRUSTS_TO_CACHE) {
+	private final HashSet<Integer> preKeysMarkedForRemoval = new HashSet<>();
+
+	private final LruCache<String, FingerprintStatus> trustCache =
+			new LruCache<String, FingerprintStatus>(NUM_TRUSTS_TO_CACHE) {
 				@Override
-				protected XmppAxolotlSession.Trust create(String fingerprint) {
-					return mXmppConnectionService.databaseBackend.isIdentityKeyTrusted(account, fingerprint);
+				protected FingerprintStatus create(String fingerprint) {
+					return mXmppConnectionService.databaseBackend.getFingerprintStatus(account, fingerprint);
 				}
 			};
 
@@ -76,9 +83,6 @@ public class SQLiteAxolotlStore implements AxolotlStore {
 		this.mXmppConnectionService = service;
 		this.localRegistrationId = loadRegistrationId();
 		this.currentPreKeyId = loadCurrentPreKeyId();
-		for (SignedPreKeyRecord record : loadSignedPreKeys()) {
-			Log.d(Config.LOGTAG, AxolotlService.getLogprefix(account) + "Got Axolotl signed prekey record:" + record.getId());
-		}
 	}
 
 	public int getCurrentPreKeyId() {
@@ -90,16 +94,18 @@ public class SQLiteAxolotlStore implements AxolotlStore {
 	// --------------------------------------
 
 	private IdentityKeyPair loadIdentityKeyPair() {
-		IdentityKeyPair ownKey = mXmppConnectionService.databaseBackend.loadOwnIdentityKeyPair(account);
+		synchronized (mXmppConnectionService) {
+			IdentityKeyPair ownKey = mXmppConnectionService.databaseBackend.loadOwnIdentityKeyPair(account);
 
-		if (ownKey != null) {
+			if (ownKey != null) {
+				return ownKey;
+			} else {
+				Log.i(Config.LOGTAG, AxolotlService.getLogprefix(account) + "Could not retrieve own IdentityKeyPair");
+				ownKey = generateIdentityKeyPair();
+				mXmppConnectionService.databaseBackend.storeOwnIdentityKeyPair(account, ownKey);
+			}
 			return ownKey;
-		} else {
-			Log.i(Config.LOGTAG, AxolotlService.getLogprefix(account) + "Could not retrieve own IdentityKeyPair");
-			ownKey = generateIdentityKeyPair();
-			mXmppConnectionService.databaseBackend.storeOwnIdentityKeyPair(account, ownKey);
 		}
-		return ownKey;
 	}
 
 	private int loadRegistrationId() {
@@ -125,15 +131,15 @@ public class SQLiteAxolotlStore implements AxolotlStore {
 	}
 
 	private int loadCurrentPreKeyId() {
-		String regIdString = this.account.getKey(JSONKEY_CURRENT_PREKEY_ID);
-		int reg_id;
-		if (regIdString != null) {
-			reg_id = Integer.valueOf(regIdString);
+		String prekeyIdString = this.account.getKey(JSONKEY_CURRENT_PREKEY_ID);
+		int prekey_id;
+		if (prekeyIdString != null) {
+			prekey_id = Integer.valueOf(prekeyIdString);
 		} else {
 			Log.w(Config.LOGTAG, AxolotlService.getLogprefix(account) + "Could not retrieve current prekey id for account " + account.getJid());
-			reg_id = 0;
+			prekey_id = 0;
 		}
-		return reg_id;
+		return prekey_id;
 	}
 
 	public void regenerate() {
@@ -177,14 +183,29 @@ public class SQLiteAxolotlStore implements AxolotlStore {
 	 * <p/>
 	 * Store a remote client's identity key as trusted.
 	 *
-	 * @param name        The name of the remote client.
+	 * @param address     The address of the remote client.
 	 * @param identityKey The remote client's identity key.
+	 * @return true on success
 	 */
 	@Override
-	public void saveIdentity(String name, IdentityKey identityKey) {
-		if (!mXmppConnectionService.databaseBackend.loadIdentityKeys(account, name).contains(identityKey)) {
-			mXmppConnectionService.databaseBackend.storeIdentityKey(account, name, identityKey);
+	public boolean saveIdentity(SignalProtocolAddress address, IdentityKey identityKey) {
+		if (!mXmppConnectionService.databaseBackend.loadIdentityKeys(account, address.getName()).contains(identityKey)) {
+			String fingerprint = CryptoHelper.bytesToHex(identityKey.getPublicKey().serialize());
+			FingerprintStatus status = getFingerprintStatus(fingerprint);
+			if (status == null) {
+				if (mXmppConnectionService.blindTrustBeforeVerification() && !account.getAxolotlService().hasVerifiedKeys(address.getName())) {
+					Log.d(Config.LOGTAG,account.getJid().asBareJid()+": blindly trusted "+fingerprint+" of "+address.getName());
+					status = FingerprintStatus.createActiveTrusted();
+				} else {
+					status = FingerprintStatus.createActiveUndecided();
+				}
+			} else {
+				status = status.toActive();
+			}
+			mXmppConnectionService.databaseBackend.storeIdentityKey(account, address.getName(), identityKey, status);
+			trustCache.remove(fingerprint);
 		}
+		return true;
 	}
 
 	/**
@@ -197,21 +218,20 @@ public class SQLiteAxolotlStore implements AxolotlStore {
 	 * store.  Only if it mismatches an entry in the local store is it considered
 	 * 'untrusted.'
 	 *
-	 * @param name        The name of the remote client.
 	 * @param identityKey The identity key to verify.
 	 * @return true if trusted, false if untrusted.
 	 */
 	@Override
-	public boolean isTrustedIdentity(String name, IdentityKey identityKey) {
+	public boolean isTrustedIdentity(SignalProtocolAddress address, IdentityKey identityKey, Direction direction) {
 		return true;
 	}
 
-	public XmppAxolotlSession.Trust getFingerprintTrust(String fingerprint) {
+	public FingerprintStatus getFingerprintStatus(String fingerprint) {
 		return (fingerprint == null)? null : trustCache.get(fingerprint);
 	}
 
-	public void setFingerprintTrust(String fingerprint, XmppAxolotlSession.Trust trust) {
-		mXmppConnectionService.databaseBackend.setIdentityKeyTrust(account, fingerprint, trust);
+	public void setFingerprintStatus(String fingerprint, FingerprintStatus status) {
+		mXmppConnectionService.databaseBackend.setIdentityKeyTrust(account, fingerprint, status);
 		trustCache.remove(fingerprint);
 	}
 
@@ -223,8 +243,8 @@ public class SQLiteAxolotlStore implements AxolotlStore {
 		return mXmppConnectionService.databaseBackend.getIdentityKeyCertifcate(account, fingerprint);
 	}
 
-	public Set<IdentityKey> getContactKeysWithTrust(String bareJid, XmppAxolotlSession.Trust trust) {
-		return mXmppConnectionService.databaseBackend.loadIdentityKeys(account, bareJid, trust);
+	public Set<IdentityKey> getContactKeysWithTrust(String bareJid, FingerprintStatus status) {
+		return mXmppConnectionService.databaseBackend.loadIdentityKeys(account, bareJid, status);
 	}
 
 	public long getContactNumTrustedKeys(String bareJid) {
@@ -249,7 +269,7 @@ public class SQLiteAxolotlStore implements AxolotlStore {
 	 * a new SessionRecord if one does not currently exist.
 	 */
 	@Override
-	public SessionRecord loadSession(AxolotlAddress address) {
+	public SessionRecord loadSession(SignalProtocolAddress address) {
 		SessionRecord session = mXmppConnectionService.databaseBackend.loadSession(this.account, address);
 		return (session != null) ? session : new SessionRecord();
 	}
@@ -263,9 +283,13 @@ public class SQLiteAxolotlStore implements AxolotlStore {
 	@Override
 	public List<Integer> getSubDeviceSessions(String name) {
 		return mXmppConnectionService.databaseBackend.getSubDeviceSessions(account,
-				new AxolotlAddress(name, 0));
+				new SignalProtocolAddress(name, 0));
 	}
 
+
+	public List<String> getKnownAddresses() {
+		return mXmppConnectionService.databaseBackend.getKnownSignalAddresses(account);
+	}
 	/**
 	 * Commit to storage the {@link SessionRecord} for a given recipientId + deviceId tuple.
 	 *
@@ -273,7 +297,7 @@ public class SQLiteAxolotlStore implements AxolotlStore {
 	 * @param record  the current SessionRecord for the remote client.
 	 */
 	@Override
-	public void storeSession(AxolotlAddress address, SessionRecord record) {
+	public void storeSession(SignalProtocolAddress address, SessionRecord record) {
 		mXmppConnectionService.databaseBackend.storeSession(account, address, record);
 	}
 
@@ -284,7 +308,7 @@ public class SQLiteAxolotlStore implements AxolotlStore {
 	 * @return true if a {@link SessionRecord} exists, false otherwise.
 	 */
 	@Override
-	public boolean containsSession(AxolotlAddress address) {
+	public boolean containsSession(SignalProtocolAddress address) {
 		return mXmppConnectionService.databaseBackend.containsSession(account, address);
 	}
 
@@ -294,7 +318,7 @@ public class SQLiteAxolotlStore implements AxolotlStore {
 	 * @param address the address of the remote client.
 	 */
 	@Override
-	public void deleteSession(AxolotlAddress address) {
+	public void deleteSession(SignalProtocolAddress address) {
 		mXmppConnectionService.databaseBackend.deleteSession(account, address);
 	}
 
@@ -305,7 +329,7 @@ public class SQLiteAxolotlStore implements AxolotlStore {
 	 */
 	@Override
 	public void deleteAllSessions(String name) {
-		AxolotlAddress address = new AxolotlAddress(name, 0);
+		SignalProtocolAddress address = new SignalProtocolAddress(name, 0);
 		mXmppConnectionService.databaseBackend.deleteAllSessions(account,
 				address);
 	}
@@ -364,7 +388,23 @@ public class SQLiteAxolotlStore implements AxolotlStore {
 	 */
 	@Override
 	public void removePreKey(int preKeyId) {
-		mXmppConnectionService.databaseBackend.deletePreKey(account, preKeyId);
+		Log.d(Config.LOGTAG,"mark prekey for removal "+preKeyId);
+		synchronized (preKeysMarkedForRemoval) {
+			preKeysMarkedForRemoval.add(preKeyId);
+		}
+	}
+
+
+	public boolean flushPreKeys() {
+		Log.d(Config.LOGTAG,"flushing pre keys");
+		int count = 0;
+		synchronized (preKeysMarkedForRemoval) {
+			for(Integer preKeyId : preKeysMarkedForRemoval) {
+				count += mXmppConnectionService.databaseBackend.deletePreKey(account, preKeyId);
+			}
+			preKeysMarkedForRemoval.clear();
+		}
+		return count > 0;
 	}
 
 	// --------------------------------------
@@ -397,6 +437,10 @@ public class SQLiteAxolotlStore implements AxolotlStore {
 		return mXmppConnectionService.databaseBackend.loadSignedPreKeys(account);
 	}
 
+	public int getSignedPreKeysCount() {
+		return mXmppConnectionService.databaseBackend.getSignedPreKeysCount(account);
+	}
+
 	/**
 	 * Store a local SignedPreKeyRecord.
 	 *
@@ -425,5 +469,9 @@ public class SQLiteAxolotlStore implements AxolotlStore {
 	@Override
 	public void removeSignedPreKey(int signedPreKeyId) {
 		mXmppConnectionService.databaseBackend.deleteSignedPreKey(account, signedPreKeyId);
+	}
+
+	public void preVerifyFingerprint(Account account, String name, String fingerprint) {
+		mXmppConnectionService.databaseBackend.storePreVerification(account,name,fingerprint,FingerprintStatus.createInactiveVerified());
 	}
 }

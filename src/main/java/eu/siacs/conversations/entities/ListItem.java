@@ -1,17 +1,19 @@
 package eu.siacs.conversations.entities;
 
+import android.content.Context;
+
 import java.util.List;
 
-import eu.siacs.conversations.xmpp.jid.Jid;
+import eu.siacs.conversations.services.AvatarService;
+import rocks.xmpp.addr.Jid;
 
-public interface ListItem extends Comparable<ListItem> {
+
+public interface ListItem extends Comparable<ListItem>, AvatarService.Avatarable {
 	String getDisplayName();
-
-	String getDisplayJid();
 
 	Jid getJid();
 
-	List<Tag> getTags();
+	List<Tag> getTags(Context context);
 
 	final class Tag {
 		private final String name;
@@ -31,5 +33,5 @@ public interface ListItem extends Comparable<ListItem> {
 		}
 	}
 
-	boolean match(final String needle);
+	boolean match(Context context, final String needle);
 }

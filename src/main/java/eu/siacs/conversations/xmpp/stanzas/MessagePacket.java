@@ -4,6 +4,7 @@ import android.util.Pair;
 
 import eu.siacs.conversations.parser.AbstractParser;
 import eu.siacs.conversations.xml.Element;
+import eu.siacs.conversations.xml.LocalizedContent;
 
 public class MessagePacket extends AbstractAcknowledgeableStanza {
 	public static final int TYPE_CHAT = 0;
@@ -16,8 +17,8 @@ public class MessagePacket extends AbstractAcknowledgeableStanza {
 		super("message");
 	}
 
-	public String getBody() {
-		return findChildContent("body");
+	public LocalizedContent getBody() {
+		return findInternationalizedChildContentInDefaultNamespace("body");
 	}
 
 	public void setBody(String text) {
@@ -83,7 +84,7 @@ public class MessagePacket extends AbstractAcknowledgeableStanza {
 		if (packet == null) {
 			return null;
 		}
-		Long timestamp = AbstractParser.getTimestamp(forwarded,null);
+		Long timestamp = AbstractParser.parseTimestamp(forwarded, null);
 		return new Pair(packet,timestamp);
 	}
 

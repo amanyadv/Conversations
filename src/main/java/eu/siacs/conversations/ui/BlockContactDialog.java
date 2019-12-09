@@ -1,38 +1,62 @@
 package eu.siacs.conversations.ui;
 
-import android.app.AlertDialog;
-import android.content.Context;
-import android.content.DialogInterface;
+import android.databinding.DataBindingUtil;
+import android.support.annotation.StringRes;
+import android.support.v7.app.AlertDialog;
+import android.text.SpannableString;
+import android.text.Spanned;
+import android.text.style.TypefaceSpan;
+import android.view.View;
+import android.widget.Toast;
 
 import eu.siacs.conversations.R;
+import eu.siacs.conversations.databinding.DialogBlockContactBinding;
 import eu.siacs.conversations.entities.Blockable;
-import eu.siacs.conversations.services.XmppConnectionService;
+import eu.siacs.conversations.entities.Conversation;
+import eu.siacs.conversations.ui.util.JidDialog;
+import rocks.xmpp.addr.Jid;
 
 public final class BlockContactDialog {
-	public static void show(final Context context,
-			final XmppConnectionService xmppConnectionService,
-			final Blockable blockable) {
-		final AlertDialog.Builder builder = new AlertDialog.Builder(context);
+	public static void show(final XmppActivity xmppActivity, final Blockable blockable) {
+		final AlertDialog.Builder builder = new AlertDialog.Builder(xmppActivity);
 		final boolean isBlocked = blockable.isBlocked();
 		builder.setNegativeButton(R.string.cancel, null);
+		DialogBlockContactBinding binding = DataBindingUtil.inflate(xmppActivity.getLayoutInflater(), R.layout.dialog_block_contact, null, false);
+		final boolean reporting = blockable.getAccount().getXmppConnection().getFeatures().spamReporting();
+		binding.reportSpam.setVisibility(!isBlocked && reporting ? View.VISIBLE : View.GONE);
+		builder.setView(binding.getRoot());
 
-		if (blockable.getJid().isDomainJid() || blockable.getAccount().isBlocked(blockable.getJid().toDomainJid())) {
+		final String value;
+		@StringRes int res;
+		if (blockable.getJid().isFullJid()) {
+			builder.setTitle(isBlocked ? R.string.action_unblock_participant : R.string.action_block_participant);
+			value = blockable.getJid().toEscapedString();
+			res = isBlocked ? R.string.unblock_contact_text : R.string.block_contact_text;
+		} else if (blockable.getJid().getLocal() == null || blockable.getAccount().isBlocked(Jid.ofDomain(blockable.getJid().getDomain()))) {
 			builder.setTitle(isBlocked ? R.string.action_unblock_domain : R.string.action_block_domain);
-			builder.setMessage(context.getResources().getString(isBlocked ? R.string.unblock_domain_text : R.string.block_domain_text,
-						blockable.getJid().toDomainJid()));
+			value = Jid.ofDomain(blockable.getJid().getDomain()).toString();
+			res = isBlocked ? R.string.unblock_domain_text : R.string.block_domain_text;
 		} else {
-			builder.setTitle(isBlocked ? R.string.action_unblock_contact : R.string.action_block_contact);
-			builder.setMessage(context.getResources().getString(isBlocked ? R.string.unblock_contact_text : R.string.block_contact_text,
-						blockable.getJid().toBareJid()));
+			int resBlockAction = blockable instanceof Conversation && ((Conversation) blockable).isWithStranger() ? R.string.block_stranger : R.string.action_block_contact;
+			builder.setTitle(isBlocked ? R.string.action_unblock_contact : resBlockAction);
+			value = blockable.getJid().asBareJid().toEscapedString();
+			res = isBlocked ? R.string.unblock_contact_text : R.string.block_contact_text;
 		}
-		builder.setPositiveButton(isBlocked ? R.string.unblock : R.string.block, new DialogInterface.OnClickListener() {
-
-			@Override
-			public void onClick(final DialogInterface dialog, final int which) {
-				if (isBlocked) {
-					xmppConnectionService.sendUnblockRequest(blockable);
-				} else {
-					xmppConnectionService.sendBlockRequest(blockable);
+		binding.text.setText(JidDialog.style(xmppActivity, res, value));
+		builder.setPositiveButton(isBlocked ? R.string.unblock : R.string.block, (dialog, which) -> {
+			if (isBlocked) {
+				xmppActivity.xmppConnectionService.sendUnblockRequest(blockable);
+			} else {
+				boolean toastShown = false;
+				if (xmppActivity.xmppConnectionService.sendBlockRequest(blockable, binding.reportSpam.isChecked())) {
+					Toast.makeText(xmppActivity, R.string.corresponding_conversations_closed, Toast.LENGTH_SHORT).show();
+					toastShown = true;
+				}
+				if (xmppActivity instanceof ContactDetailsActivity) {
+					if (!toastShown) {
+						Toast.makeText(xmppActivity, R.string.contact_blocked_past_tense, Toast.LENGTH_SHORT).show();
+					}
+					xmppActivity.finish();
 				}
 			}
 		});

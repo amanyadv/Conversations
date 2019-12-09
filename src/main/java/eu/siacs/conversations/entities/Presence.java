@@ -1,5 +1,7 @@
 package eu.siacs.conversations.entities;
 
+import android.support.annotation.NonNull;
+
 import java.lang.Comparable;
 import java.util.Locale;
 
@@ -17,44 +19,52 @@ public class Presence implements Comparable {
 				case XA:   return "xa";
 				case DND:  return "dnd";
 			}
-
 			return null;
 		}
-	}
 
-	protected final Status status;
-	protected ServiceDiscoveryResult disco;
-	protected final String ver;
-	protected final String hash;
-
-	private Presence(Status status, String ver, String hash) {
-		this.status = status;
-		this.ver = ver;
-		this.hash = hash;
-	}
-
-	public static Presence parse(String show, Element caps) {
-		final String hash = caps == null ? null : caps.getAttribute("hash");
-		final String ver = caps == null ? null : caps.getAttribute("ver");
-		if (show == null) {
-			return new Presence(Status.ONLINE, ver, hash);
-		} else {
-			switch (show.toLowerCase(Locale.US)) {
-				case "away":
-					return new Presence(Status.AWAY, ver, hash);
-				case "xa":
-					return new Presence(Status.XA, ver, hash);
-				case "dnd":
-					return new Presence(Status.DND, ver, hash);
-				case "chat":
-					return new Presence(Status.CHAT, ver, hash);
-				default:
-					return new Presence(Status.ONLINE, ver, hash);
+		public static Status fromShowString(String show) {
+			if (show == null) {
+				return ONLINE;
+			} else {
+				switch (show.toLowerCase(Locale.US)) {
+					case "away":
+						return AWAY;
+					case "xa":
+						return XA;
+					case "dnd":
+						return DND;
+					case "chat":
+						return CHAT;
+					default:
+						return ONLINE;
+				}
 			}
 		}
 	}
 
-	public int compareTo(Object other) {
+	private final Status status;
+	private ServiceDiscoveryResult disco;
+	private final String ver;
+	private final String hash;
+	private final String node;
+	private final String message;
+
+	private Presence(Status status, String ver, String hash, String node, String message) {
+		this.status = status;
+		this.ver = ver;
+		this.hash = hash;
+		this.node = node;
+		this.message = message;
+	}
+
+	public static Presence parse(String show, Element caps, String message) {
+		final String hash = caps == null ? null : caps.getAttribute("hash");
+		final String ver = caps == null ? null : caps.getAttribute("ver");
+		final String node = caps == null ? null : caps.getAttribute("node");
+		return new Presence(Status.fromShowString(show), ver, hash, node, message);
+	}
+
+	public int compareTo(@NonNull Object other) {
 		return this.status.compareTo(((Presence)other).status);
 	}
 
@@ -70,11 +80,23 @@ public class Presence implements Comparable {
 		return this.ver;
 	}
 
+	public String getNode() {
+		return this.node;
+	}
+
 	public String getHash() {
 		return this.hash;
 	}
 
+	public String getMessage() {
+		return this.message;
+	}
+
 	public void setServiceDiscoveryResult(ServiceDiscoveryResult disco) {
 		this.disco = disco;
+	}
+
+	public ServiceDiscoveryResult getServiceDiscoveryResult() {
+		return disco;
 	}
 }

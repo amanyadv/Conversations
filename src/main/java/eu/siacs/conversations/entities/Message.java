@@ -2,24 +2,36 @@ package eu.siacs.conversations.entities;
 
 import android.content.ContentValues;
 import android.database.Cursor;
+import android.graphics.Color;
+import android.text.SpannableStringBuilder;
+import android.util.Log;
 
+import org.json.JSONException;
+
+import java.lang.ref.WeakReference;
 import java.net.MalformedURLException;
 import java.net.URL;
-import java.util.Arrays;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashSet;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Set;
 
 import eu.siacs.conversations.Config;
-import eu.siacs.conversations.crypto.axolotl.XmppAxolotlSession;
+import eu.siacs.conversations.crypto.axolotl.FingerprintStatus;
+import eu.siacs.conversations.services.AvatarService;
+import eu.siacs.conversations.utils.CryptoHelper;
+import eu.siacs.conversations.utils.Emoticons;
 import eu.siacs.conversations.utils.GeoHelper;
+import eu.siacs.conversations.utils.MessageUtils;
 import eu.siacs.conversations.utils.MimeUtils;
 import eu.siacs.conversations.utils.UIHelper;
-import eu.siacs.conversations.xmpp.jid.InvalidJidException;
-import eu.siacs.conversations.xmpp.jid.Jid;
+import rocks.xmpp.addr.Jid;
 
-public class Message extends AbstractEntity {
+public class Message extends AbstractEntity implements AvatarService.Avatarable  {
 
 	public static final String TABLENAME = "messages";
-
-	public static final String MERGE_SEPARATOR = " \u200B\n\n";
 
 	public static final int STATUS_RECEIVED = 0;
 	public static final int STATUS_UNSEND = 1;
@@ -36,17 +48,21 @@ public class Message extends AbstractEntity {
 	public static final int ENCRYPTION_DECRYPTED = 3;
 	public static final int ENCRYPTION_DECRYPTION_FAILED = 4;
 	public static final int ENCRYPTION_AXOLOTL = 5;
+	public static final int ENCRYPTION_AXOLOTL_NOT_FOR_THIS_DEVICE = 6;
+	public static final int ENCRYPTION_AXOLOTL_FAILED = 7;
 
 	public static final int TYPE_TEXT = 0;
 	public static final int TYPE_IMAGE = 1;
 	public static final int TYPE_FILE = 2;
 	public static final int TYPE_STATUS = 3;
 	public static final int TYPE_PRIVATE = 4;
+	public static final int TYPE_PRIVATE_FILE = 5;
 
 	public static final String CONVERSATION = "conversationUuid";
 	public static final String COUNTERPART = "counterpart";
 	public static final String TRUE_COUNTERPART = "trueCounterpart";
 	public static final String BODY = "body";
+	public static final String BODY_LANGUAGE = "bodyLanguage";
 	public static final String TIME_SENT = "timeSent";
 	public static final String ENCRYPTION = "encryption";
 	public static final String STATUS = "status";
@@ -59,7 +75,13 @@ public class Message extends AbstractEntity {
 	public static final String RELATIVE_FILE_PATH = "relativeFilePath";
 	public static final String FINGERPRINT = "axolotl_fingerprint";
 	public static final String READ = "read";
+	public static final String ERROR_MESSAGE = "errorMsg";
+	public static final String READ_BY_MARKERS = "readByMarkers";
+	public static final String MARKABLE = "markable";
+	public static final String DELETED = "deleted";
 	public static final String ME_COMMAND = "/me ";
+
+	public static final String ERROR_MESSAGE_CANCELLED = "eu.siacs.conversations.cancelled";
 
 
 	public boolean markable = false;
@@ -72,31 +94,42 @@ public class Message extends AbstractEntity {
 	protected int encryption;
 	protected int status;
 	protected int type;
+	protected boolean deleted = false;
 	protected boolean carbon = false;
 	protected boolean oob = false;
-	protected String edited = null;
+	protected List<Edit> edits = new ArrayList<>();
 	protected String relativeFilePath;
 	protected boolean read = true;
 	protected String remoteMsgId = null;
+	private String bodyLanguage = null;
 	protected String serverMsgId = null;
-	protected Conversation conversation = null;
+	private final Conversational conversation;
 	protected Transferable transferable = null;
 	private Message mNextMessage = null;
 	private Message mPreviousMessage = null;
 	private String axolotlFingerprint = null;
+	private String errorMessage = null;
+	private Set<ReadByMarker> readByMarkers = new HashSet<>();
 
-	private Message() {
+	private Boolean isGeoUri = null;
+	private Boolean isEmojisOnly = null;
+	private Boolean treatAsDownloadable = null;
+	private FileParams fileParams = null;
+	private List<MucOptions.User> counterparts;
+	private WeakReference<MucOptions.User> user;
 
+	protected Message(Conversational conversation) {
+		this.conversation = conversation;
 	}
 
-	public Message(Conversation conversation, String body, int encryption) {
+	public Message(Conversational conversation, String body, int encryption) {
 		this(conversation, body, encryption, STATUS_UNSEND);
 	}
 
-	public Message(Conversation conversation, String body, int encryption, int status) {
-		this(java.util.UUID.randomUUID().toString(),
+	public Message(Conversational conversation, String body, int encryption, int status) {
+		this(conversation, java.util.UUID.randomUUID().toString(),
 				conversation.getUuid(),
-				conversation.getJid() == null ? null : conversation.getJid().toBareJid(),
+				conversation.getJid() == null ? null : conversation.getJid().asBareJid(),
 				null,
 				body,
 				System.currentTimeMillis(),
@@ -110,21 +143,27 @@ public class Message extends AbstractEntity {
 				null,
 				true,
 				null,
-				false);
-		this.conversation = conversation;
+				false,
+				null,
+				null,
+				false,
+				false,
+				null);
 	}
 
-	private Message(final String uuid, final String conversationUUid, final Jid counterpart,
-					final Jid trueCounterpart, final String body, final long timeSent,
-					final int encryption, final int status, final int type, final boolean carbon,
-					final String remoteMsgId, final String relativeFilePath,
-					final String serverMsgId, final String fingerprint, final boolean read,
-					final String edited, final boolean oob) {
+	protected Message(final Conversational conversation, final String uuid, final String conversationUUid, final Jid counterpart,
+	                final Jid trueCounterpart, final String body, final long timeSent,
+	                final int encryption, final int status, final int type, final boolean carbon,
+	                final String remoteMsgId, final String relativeFilePath,
+	                final String serverMsgId, final String fingerprint, final boolean read,
+	                final String edited, final boolean oob, final String errorMessage, final Set<ReadByMarker> readByMarkers,
+	                final boolean markable, final boolean deleted, final String bodyLanguage) {
+		this.conversation = conversation;
 		this.uuid = uuid;
 		this.conversationUuid = conversationUUid;
 		this.counterpart = counterpart;
 		this.trueCounterpart = trueCounterpart;
-		this.body = body;
+		this.body = body == null ? "" : body;
 		this.timeSent = timeSent;
 		this.encryption = encryption;
 		this.status = status;
@@ -135,37 +174,21 @@ public class Message extends AbstractEntity {
 		this.serverMsgId = serverMsgId;
 		this.axolotlFingerprint = fingerprint;
 		this.read = read;
-		this.edited = edited;
+		this.edits = Edit.fromJson(edited);
 		this.oob = oob;
+		this.errorMessage = errorMessage;
+		this.readByMarkers = readByMarkers == null ? new HashSet<>() : readByMarkers;
+		this.markable = markable;
+		this.deleted = deleted;
+		this.bodyLanguage = bodyLanguage;
 	}
 
-	public static Message fromCursor(Cursor cursor) {
-		Jid jid;
-		try {
-			String value = cursor.getString(cursor.getColumnIndex(COUNTERPART));
-			if (value != null) {
-				jid = Jid.fromString(value, true);
-			} else {
-				jid = null;
-			}
-		} catch (InvalidJidException e) {
-			jid = null;
-		}
-		Jid trueCounterpart;
-		try {
-			String value = cursor.getString(cursor.getColumnIndex(TRUE_COUNTERPART));
-			if (value != null) {
-				trueCounterpart = Jid.fromString(value, true);
-			} else {
-				trueCounterpart = null;
-			}
-		} catch (InvalidJidException e) {
-			trueCounterpart = null;
-		}
-		return new Message(cursor.getString(cursor.getColumnIndex(UUID)),
+	public static Message fromCursor(Cursor cursor, Conversation conversation) {
+		return new Message(conversation,
+				cursor.getString(cursor.getColumnIndex(UUID)),
 				cursor.getString(cursor.getColumnIndex(CONVERSATION)),
-				jid,
-				trueCounterpart,
+				fromString(cursor.getString(cursor.getColumnIndex(COUNTERPART))),
+				fromString(cursor.getString(cursor.getColumnIndex(TRUE_COUNTERPART))),
 				cursor.getString(cursor.getColumnIndex(BODY)),
 				cursor.getLong(cursor.getColumnIndex(TIME_SENT)),
 				cursor.getInt(cursor.getColumnIndex(ENCRYPTION)),
@@ -178,22 +201,38 @@ public class Message extends AbstractEntity {
 				cursor.getString(cursor.getColumnIndex(FINGERPRINT)),
 				cursor.getInt(cursor.getColumnIndex(READ)) > 0,
 				cursor.getString(cursor.getColumnIndex(EDITED)),
-				cursor.getInt(cursor.getColumnIndex(OOB)) > 0);
+				cursor.getInt(cursor.getColumnIndex(OOB)) > 0,
+				cursor.getString(cursor.getColumnIndex(ERROR_MESSAGE)),
+				ReadByMarker.fromJsonString(cursor.getString(cursor.getColumnIndex(READ_BY_MARKERS))),
+				cursor.getInt(cursor.getColumnIndex(MARKABLE)) > 0,
+				cursor.getInt(cursor.getColumnIndex(DELETED)) > 0,
+				cursor.getString(cursor.getColumnIndex(BODY_LANGUAGE))
+		);
+	}
+
+	private static Jid fromString(String value) {
+		try {
+			if (value != null) {
+				return Jid.of(value);
+			}
+		} catch (IllegalArgumentException e) {
+			return null;
+		}
+		return null;
 	}
 
 	public static Message createStatusMessage(Conversation conversation, String body) {
-		final Message message = new Message();
+		final Message message = new Message(conversation);
 		message.setType(Message.TYPE_STATUS);
-		message.setConversation(conversation);
-		message.setBody(body);
+		message.setStatus(Message.STATUS_RECEIVED);
+		message.body = body;
 		return message;
 	}
 
 	public static Message createLoadMoreMessage(Conversation conversation) {
-		final Message message = new Message();
+		final Message message = new Message(conversation);
 		message.setType(Message.TYPE_STATUS);
-		message.setConversation(conversation);
-		message.setBody("LOAD_MORE");
+		message.body = "LOAD_MORE";
 		return message;
 	}
 
@@ -212,7 +251,7 @@ public class Message extends AbstractEntity {
 		} else {
 			values.put(TRUE_COUNTERPART, trueCounterpart.toString());
 		}
-		values.put(BODY, body);
+		values.put(BODY, body.length() > Config.MAX_STORAGE_MESSAGE_CHARS ? body.substring(0, Config.MAX_STORAGE_MESSAGE_CHARS) : body);
 		values.put(TIME_SENT, timeSent);
 		values.put(ENCRYPTION, encryption);
 		values.put(STATUS, status);
@@ -222,9 +261,18 @@ public class Message extends AbstractEntity {
 		values.put(RELATIVE_FILE_PATH, relativeFilePath);
 		values.put(SERVER_MSG_ID, serverMsgId);
 		values.put(FINGERPRINT, axolotlFingerprint);
-		values.put(READ,read ? 1 : 0);
-		values.put(EDITED, edited);
+		values.put(READ, read ? 1 : 0);
+		try {
+			values.put(EDITED, Edit.toJson(edits));
+		} catch (JSONException e) {
+			Log.e(Config.LOGTAG,"error persisting json for edits",e);
+		}
 		values.put(OOB, oob ? 1 : 0);
+		values.put(ERROR_MESSAGE, errorMessage);
+		values.put(READ_BY_MARKERS, ReadByMarker.toJson(readByMarkers).toString());
+		values.put(MARKABLE, markable ? 1 : 0);
+		values.put(DELETED, deleted ? 1 : 0);
+		values.put(BODY_LANGUAGE, bodyLanguage);
 		return values;
 	}
 
@@ -232,12 +280,8 @@ public class Message extends AbstractEntity {
 		return conversationUuid;
 	}
 
-	public Conversation getConversation() {
+	public Conversational getConversation() {
 		return this.conversation;
-	}
-
-	public void setConversation(Conversation conv) {
-		this.conversation = conv;
 	}
 
 	public Jid getCounterpart() {
@@ -256,7 +300,7 @@ public class Message extends AbstractEntity {
 				return null;
 			} else {
 				return this.conversation.getAccount().getRoster()
-						.getContactFromRoster(this.trueCounterpart);
+						.getContactFromContactList(this.trueCounterpart);
 			}
 		}
 	}
@@ -265,8 +309,36 @@ public class Message extends AbstractEntity {
 		return body;
 	}
 
-	public void setBody(String body) {
+	public synchronized void setBody(String body) {
+		if (body == null) {
+			throw new Error("You should not set the message body to null");
+		}
 		this.body = body;
+		this.isGeoUri = null;
+		this.isEmojisOnly = null;
+		this.treatAsDownloadable = null;
+		this.fileParams = null;
+	}
+
+	public void setMucUser(MucOptions.User user) {
+		this.user = new WeakReference<>(user);
+	}
+
+	public boolean sameMucUser(Message otherMessage) {
+		final MucOptions.User thisUser = this.user == null ? null : this.user.get();
+		final MucOptions.User otherUser = otherMessage.user == null ? null : otherMessage.user.get();
+		return thisUser != null && thisUser == otherUser;
+	}
+
+	public String getErrorMessage() {
+		return errorMessage;
+	}
+
+	public boolean setErrorMessage(String message) {
+		boolean changed = (message != null && !message.equals(errorMessage))
+				|| (message == null && errorMessage != null);
+		this.errorMessage = message;
+		return changed;
 	}
 
 	public long getTimeSent() {
@@ -317,6 +389,14 @@ public class Message extends AbstractEntity {
 		return this.read;
 	}
 
+	public boolean isDeleted() {
+		return this.deleted;
+	}
+
+	public void setDeleted(boolean deleted) {
+		this.deleted = deleted;
+	}
+
 	public void markRead() {
 		this.read = true;
 	}
@@ -353,12 +433,32 @@ public class Message extends AbstractEntity {
 		this.carbon = carbon;
 	}
 
-	public void setEdited(String edited) {
-		this.edited = edited;
+	public void putEdited(String edited, String serverMsgId) {
+		final Edit edit = new Edit(edited, serverMsgId);
+		if (this.edits.size() < 128 && !this.edits.contains(edit)) {
+			this.edits.add(edit);
+		}
+	}
+
+	boolean remoteMsgIdMatchInEdit(String id) {
+		for(Edit edit : this.edits) {
+			if (id.equals(edit.getEditedId())) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	public String getBodyLanguage() {
+		return this.bodyLanguage;
+	}
+
+	public void setBodyLanguage(String language) {
+		this.bodyLanguage = language;
 	}
 
 	public boolean edited() {
-		return this.edited != null;
+		return this.edits.size() > 0;
 	}
 
 	public void setTrueCounterpart(Jid trueCounterpart) {
@@ -373,13 +473,46 @@ public class Message extends AbstractEntity {
 		return this.transferable;
 	}
 
-	public void setTransferable(Transferable transferable) {
+	public synchronized void setTransferable(Transferable transferable) {
+		this.fileParams = null;
 		this.transferable = transferable;
 	}
 
-	public boolean equals(Message message) {
-		if (this.serverMsgId != null && message.getServerMsgId() != null) {
-			return this.serverMsgId.equals(message.getServerMsgId());
+	public boolean addReadByMarker(ReadByMarker readByMarker) {
+		if (readByMarker.getRealJid() != null) {
+			if (readByMarker.getRealJid().asBareJid().equals(trueCounterpart)) {
+				return false;
+			}
+		} else if (readByMarker.getFullJid() != null) {
+			if (readByMarker.getFullJid().equals(counterpart)) {
+				return false;
+			}
+		}
+		if (this.readByMarkers.add(readByMarker)) {
+			if (readByMarker.getRealJid() != null && readByMarker.getFullJid() != null) {
+				Iterator<ReadByMarker> iterator = this.readByMarkers.iterator();
+				while (iterator.hasNext()) {
+					ReadByMarker marker = iterator.next();
+					if (marker.getRealJid() == null && readByMarker.getFullJid().equals(marker.getFullJid())) {
+						iterator.remove();
+					}
+				}
+			}
+			return true;
+		} else {
+			return false;
+		}
+	}
+
+	public Set<ReadByMarker> getReadByMarkers() {
+		return Collections.unmodifiableSet(this.readByMarkers);
+	}
+
+	boolean similar(Message message) {
+		if (!isPrivateMessage() && this.serverMsgId != null && message.getServerMsgId() != null) {
+			return this.serverMsgId.equals(message.getServerMsgId()) || Edit.wasPreviouslyEditedServerMsgId(edits, message.getServerMsgId());
+		} else if (Edit.wasPreviouslyEditedServerMsgId(edits, message.getServerMsgId())) {
+			return true;
 		} else if (this.body == null || this.counterpart == null) {
 			return false;
 		} else {
@@ -391,15 +524,18 @@ public class Message extends AbstractEntity {
 				body = this.body;
 				otherBody = message.body;
 			}
+			final boolean matchingCounterpart = this.counterpart.equals(message.getCounterpart());
 			if (message.getRemoteMsgId() != null) {
+				final boolean hasUuid = CryptoHelper.UUID_PATTERN.matcher(message.getRemoteMsgId()).matches();
+				if (hasUuid && matchingCounterpart && Edit.wasPreviouslyEditedRemoteMsgId(edits, message.getRemoteMsgId())) {
+					return true;
+				}
 				return (message.getRemoteMsgId().equals(this.remoteMsgId) || message.getRemoteMsgId().equals(this.uuid))
-						&& this.counterpart.equals(message.getCounterpart())
-						&& (body.equals(otherBody)
-						||(message.getEncryption() == Message.ENCRYPTION_PGP
-						&&  message.getRemoteMsgId().matches("[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}"))) ;
+						&& matchingCounterpart
+						&& (body.equals(otherBody) || (message.getEncryption() == Message.ENCRYPTION_PGP && hasUuid));
 			} else {
 				return this.remoteMsgId == null
-						&& this.counterpart.equals(message.getCounterpart())
+						&& matchingCounterpart
 						&& body.equals(otherBody)
 						&& Math.abs(this.getTimeSent() - message.getTimeSent()) < Config.MESSAGE_MERGE_WINDOW * 1000;
 			}
@@ -407,36 +543,46 @@ public class Message extends AbstractEntity {
 	}
 
 	public Message next() {
-		synchronized (this.conversation.messages) {
-			if (this.mNextMessage == null) {
-				int index = this.conversation.messages.indexOf(this);
-				if (index < 0 || index >= this.conversation.messages.size() - 1) {
-					this.mNextMessage = null;
-				} else {
-					this.mNextMessage = this.conversation.messages.get(index + 1);
+		if (this.conversation instanceof Conversation) {
+			final Conversation conversation = (Conversation) this.conversation;
+			synchronized (conversation.messages) {
+				if (this.mNextMessage == null) {
+					int index = conversation.messages.indexOf(this);
+					if (index < 0 || index >= conversation.messages.size() - 1) {
+						this.mNextMessage = null;
+					} else {
+						this.mNextMessage = conversation.messages.get(index + 1);
+					}
 				}
+				return this.mNextMessage;
 			}
-			return this.mNextMessage;
+		} else {
+			throw new AssertionError("Calling next should be disabled for stubs");
 		}
 	}
 
 	public Message prev() {
-		synchronized (this.conversation.messages) {
-			if (this.mPreviousMessage == null) {
-				int index = this.conversation.messages.indexOf(this);
-				if (index <= 0 || index > this.conversation.messages.size()) {
-					this.mPreviousMessage = null;
-				} else {
-					this.mPreviousMessage = this.conversation.messages.get(index - 1);
+		if (this.conversation instanceof Conversation) {
+			final Conversation conversation = (Conversation) this.conversation;
+			synchronized (conversation.messages) {
+				if (this.mPreviousMessage == null) {
+					int index = conversation.messages.indexOf(this);
+					if (index <= 0 || index > conversation.messages.size()) {
+						this.mPreviousMessage = null;
+					} else {
+						this.mPreviousMessage = conversation.messages.get(index - 1);
+					}
 				}
 			}
 			return this.mPreviousMessage;
+		} else {
+			throw new AssertionError("Calling prev should be disabled for stubs");
 		}
 	}
 
 	public boolean isLastCorrectableMessage() {
 		Message next = next();
-		while(next != null) {
+		while (next != null) {
 			if (next.isCorrectable()) {
 				return false;
 			}
@@ -464,15 +610,19 @@ public class Message extends AbstractEntity {
 						this.getCounterpart().equals(message.getCounterpart()) &&
 						this.edited() == message.edited() &&
 						(message.getTimeSent() - this.getTimeSent()) <= (Config.MESSAGE_MERGE_WINDOW * 1000) &&
-						!GeoHelper.isGeoUri(message.getBody()) &&
-						!GeoHelper.isGeoUri(this.body) &&
-						message.treatAsDownloadable() == Decision.NEVER &&
-						this.treatAsDownloadable() == Decision.NEVER &&
+						this.getBody().length() + message.getBody().length() <= Config.MAX_DISPLAY_MESSAGE_CHARS &&
+						!message.isGeoUri() &&
+						!this.isGeoUri() &&
+						!message.treatAsDownloadable() &&
+						!this.treatAsDownloadable() &&
 						!message.getBody().startsWith(ME_COMMAND) &&
 						!this.getBody().startsWith(ME_COMMAND) &&
-						!this.bodyIsHeart() &&
-						!message.bodyIsHeart() &&
-						this.isTrusted() == message.isTrusted()
+						!this.bodyIsOnlyEmojis() &&
+						!message.bodyIsOnlyEmojis() &&
+						((this.axolotlFingerprint == null && message.axolotlFingerprint == null) || this.axolotlFingerprint.equals(message.getFingerprint())) &&
+						UIHelper.sameDay(message.getTimeSent(), this.getTimeSent()) &&
+						this.getReadByMarkers().equals(message.getReadByMarkers()) &&
+						!this.conversation.getJid().asBareJid().equals(Config.BUG_REPORTS)
 				);
 	}
 
@@ -480,33 +630,60 @@ public class Message extends AbstractEntity {
 		return a == b || (
 				(a == Message.STATUS_SEND_RECEIVED && b == Message.STATUS_UNSEND)
 						|| (a == Message.STATUS_SEND_RECEIVED && b == Message.STATUS_SEND)
-						|| (a == Message.STATUS_UNSEND && b == Message.STATUS_SEND)
-						|| (a == Message.STATUS_UNSEND && b == Message.STATUS_SEND_RECEIVED)
+						|| (a == Message.STATUS_SEND_RECEIVED && b == Message.STATUS_WAITING)
 						|| (a == Message.STATUS_SEND && b == Message.STATUS_UNSEND)
-						|| (a == Message.STATUS_SEND && b == Message.STATUS_SEND_RECEIVED)
+						|| (a == Message.STATUS_SEND && b == Message.STATUS_WAITING)
 		);
 	}
 
-	public String getMergedBody() {
-		StringBuilder body = new StringBuilder(this.body.trim());
-		Message current = this;
-		while(current.mergeable(current.next())) {
-			current = current.next();
-			body.append(MERGE_SEPARATOR);
-			body.append(current.getBody().trim());
+	public void setCounterparts(List<MucOptions.User> counterparts) {
+		this.counterparts = counterparts;
+	}
+
+	public List<MucOptions.User> getCounterparts() {
+		return this.counterparts;
+	}
+
+	@Override
+	public int getAvatarBackgroundColor() {
+		if (type == Message.TYPE_STATUS && getCounterparts() != null && getCounterparts().size() > 1) {
+			return Color.TRANSPARENT;
+		} else {
+			return UIHelper.getColorForName(UIHelper.getMessageDisplayName(this));
 		}
-		return body.toString();
+	}
+
+	public static class MergeSeparator {
+	}
+
+	public SpannableStringBuilder getMergedBody() {
+		SpannableStringBuilder body = new SpannableStringBuilder(MessageUtils.filterLtrRtl(this.body).trim());
+		Message current = this;
+		while (current.mergeable(current.next())) {
+			current = current.next();
+			if (current == null) {
+				break;
+			}
+			body.append("\n\n");
+			body.setSpan(new MergeSeparator(), body.length() - 2, body.length(),
+					SpannableStringBuilder.SPAN_EXCLUSIVE_EXCLUSIVE);
+			body.append(MessageUtils.filterLtrRtl(current.getBody()).trim());
+		}
+		return body;
 	}
 
 	public boolean hasMeCommand() {
-		return getMergedBody().startsWith(ME_COMMAND);
+		return this.body.trim().startsWith(ME_COMMAND);
 	}
 
 	public int getMergedStatus() {
 		int status = this.status;
 		Message current = this;
-		while(current.mergeable(current.next())) {
+		while (current.mergeable(current.next())) {
 			current = current.next();
+			if (current == null) {
+				break;
+			}
 			status = current.status;
 		}
 		return status;
@@ -515,8 +692,11 @@ public class Message extends AbstractEntity {
 	public long getMergedTimeSent() {
 		long time = this.timeSent;
 		Message current = this;
-		while(current.mergeable(current.next())) {
+		while (current.mergeable(current.next())) {
 			current = current.next();
+			if (current == null) {
+				break;
+			}
 			time = current.timeSent;
 		}
 		return time;
@@ -529,20 +709,20 @@ public class Message extends AbstractEntity {
 
 	public boolean trusted() {
 		Contact contact = this.getContact();
-		return (status > STATUS_RECEIVED || (contact != null && contact.trusted()));
+		return status > STATUS_RECEIVED || (contact != null && (contact.showInContactList() || contact.isSelf()));
 	}
 
 	public boolean fixCounterpart() {
 		Presences presences = conversation.getContact().getPresences();
-		if (counterpart != null && presences.has(counterpart.getResourcepart())) {
+		if (counterpart != null && presences.has(counterpart.getResource())) {
 			return true;
 		} else if (presences.size() >= 1) {
 			try {
-				counterpart = Jid.fromParts(conversation.getJid().getLocalpart(),
-						conversation.getJid().getDomainpart(),
-						presences.asStringArray()[0]);
+				counterpart = Jid.of(conversation.getJid().getLocal(),
+						conversation.getJid().getDomain(),
+						presences.toResourceArray()[0]);
 				return true;
-			} catch (InvalidJidException e) {
+			} catch (IllegalArgumentException e) {
 				counterpart = null;
 				return false;
 			}
@@ -557,194 +737,119 @@ public class Message extends AbstractEntity {
 	}
 
 	public String getEditedId() {
-		return edited;
+		if (edits.size() > 0) {
+			return edits.get(edits.size() - 1).getEditedId();
+		} else {
+			throw new IllegalStateException("Attempting to store unedited message");
+		}
+	}
+
+	public String getEditedIdWireFormat() {
+		if (edits.size() > 0) {
+			return edits.get(Config.USE_LMC_VERSION_1_1 ? 0 : edits.size() - 1).getEditedId();
+		} else {
+			throw new IllegalStateException("Attempting to store unedited message");
+		}
 	}
 
 	public void setOob(boolean isOob) {
 		this.oob = isOob;
 	}
 
-	public enum Decision {
-		MUST,
-		SHOULD,
-		NEVER,
-	}
-
-	private static String extractRelevantExtension(URL url) {
-		String path = url.getPath();
-		return extractRelevantExtension(path);
-	}
-
-	private static String extractRelevantExtension(String path) {
-		if (path == null || path.isEmpty()) {
-			return null;
-		}
-		
-		String filename = path.substring(path.lastIndexOf('/') + 1).toLowerCase();
-		int dotPosition = filename.lastIndexOf(".");
-
-		if (dotPosition != -1) {
-			String extension = filename.substring(dotPosition + 1);
-			// we want the real file extension, not the crypto one
-			if (Transferable.VALID_CRYPTO_EXTENSIONS.contains(extension)) {
-				return extractRelevantExtension(filename.substring(0,dotPosition));
-			} else {
-				return extension;
-			}
-		}
-		return null;
-	}
-
 	public String getMimeType() {
+		String extension;
 		if (relativeFilePath != null) {
-			int start = relativeFilePath.lastIndexOf('.') + 1;
-			if (start < relativeFilePath.length()) {
-				return MimeUtils.guessMimeTypeFromExtension(relativeFilePath.substring(start));
-			} else {
-				return null;
-			}
+			extension = MimeUtils.extractRelevantExtension(relativeFilePath);
 		} else {
 			try {
-				return MimeUtils.guessMimeTypeFromExtension(extractRelevantExtension(new URL(body.trim())));
+				final URL url = new URL(body.split("\n")[0]);
+				extension = MimeUtils.extractRelevantExtension(url);
 			} catch (MalformedURLException e) {
 				return null;
 			}
 		}
+		return MimeUtils.guessMimeTypeFromExtension(extension);
 	}
 
-	public Decision treatAsDownloadable() {
-		if (body.trim().contains(" ")) {
-			return Decision.NEVER;
+	public synchronized boolean treatAsDownloadable() {
+		if (treatAsDownloadable == null) {
+			treatAsDownloadable = MessageUtils.treatAsDownloadable(this.body, this.oob);
 		}
-		try {
-			URL url = new URL(body);
-			if (!url.getProtocol().equalsIgnoreCase("http") && !url.getProtocol().equalsIgnoreCase("https")) {
-				return Decision.NEVER;
-			} else if (oob) {
-				return Decision.MUST;
-			}
-			String extension = extractRelevantExtension(url);
-			if (extension == null) {
-				return Decision.NEVER;
-			}
-			String ref = url.getRef();
-			boolean encrypted = ref != null && ref.matches("([A-Fa-f0-9]{2}){48}");
-
-			if (encrypted) {
-				if (MimeUtils.guessMimeTypeFromExtension(extension) != null) {
-					return Decision.MUST;
-				} else {
-					return Decision.NEVER;
-				}
-			} else if (Transferable.VALID_IMAGE_EXTENSIONS.contains(extension)
-					|| Transferable.WELL_KNOWN_EXTENSIONS.contains(extension)) {
-				return Decision.SHOULD;
-			} else {
-				return Decision.NEVER;
-			}
-
-		} catch (MalformedURLException e) {
-			return Decision.NEVER;
-		}
+		return treatAsDownloadable;
 	}
 
-	public boolean bodyIsHeart() {
-		return body != null && UIHelper.HEARTS.contains(body.trim());
+	public synchronized boolean bodyIsOnlyEmojis() {
+		if (isEmojisOnly == null) {
+			isEmojisOnly = Emoticons.isOnlyEmoji(body.replaceAll("\\s", ""));
+		}
+		return isEmojisOnly;
 	}
 
-	public FileParams getFileParams() {
-		FileParams params = getLegacyFileParams();
-		if (params != null) {
-			return params;
+	public synchronized boolean isGeoUri() {
+		if (isGeoUri == null) {
+			isGeoUri = GeoHelper.GEO_URI.matcher(body).matches();
 		}
-		params = new FileParams();
-		if (this.transferable != null) {
-			params.size = this.transferable.getFileSize();
-		}
-		if (body == null) {
-			return params;
-		}
-		String parts[] = body.split("\\|");
-		switch (parts.length) {
-			case 1:
-				try {
-					params.size = Long.parseLong(parts[0]);
-				} catch (NumberFormatException e) {
+		return isGeoUri;
+	}
+
+	public synchronized void resetFileParams() {
+		this.fileParams = null;
+	}
+
+	public synchronized FileParams getFileParams() {
+		if (fileParams == null) {
+			fileParams = new FileParams();
+			if (this.transferable != null) {
+				fileParams.size = this.transferable.getFileSize();
+			}
+			String parts[] = body == null ? new String[0] : body.split("\\|");
+			switch (parts.length) {
+				case 1:
 					try {
-						params.url = new URL(parts[0]);
-					} catch (MalformedURLException e1) {
-						params.url = null;
+						fileParams.size = Long.parseLong(parts[0]);
+					} catch (NumberFormatException e) {
+						fileParams.url = parseUrl(parts[0]);
 					}
-				}
-				break;
-			case 2:
-			case 4:
-				try {
-					params.url = new URL(parts[0]);
-				} catch (MalformedURLException e1) {
-					params.url = null;
-				}
-				try {
-					params.size = Long.parseLong(parts[1]);
-				} catch (NumberFormatException e) {
-					params.size = 0;
-				}
-				try {
-					params.width = Integer.parseInt(parts[2]);
-				} catch (NumberFormatException | ArrayIndexOutOfBoundsException e) {
-					params.width = 0;
-				}
-				try {
-					params.height = Integer.parseInt(parts[3]);
-				} catch (NumberFormatException | ArrayIndexOutOfBoundsException e) {
-					params.height = 0;
-				}
-				break;
-			case 3:
-				try {
-					params.size = Long.parseLong(parts[0]);
-				} catch (NumberFormatException e) {
-					params.size = 0;
-				}
-				try {
-					params.width = Integer.parseInt(parts[1]);
-				} catch (NumberFormatException e) {
-					params.width = 0;
-				}
-				try {
-					params.height = Integer.parseInt(parts[2]);
-				} catch (NumberFormatException e) {
-					params.height = 0;
-				}
-				break;
+					break;
+				case 5:
+					fileParams.runtime = parseInt(parts[4]);
+				case 4:
+					fileParams.width = parseInt(parts[2]);
+					fileParams.height = parseInt(parts[3]);
+				case 2:
+					fileParams.url = parseUrl(parts[0]);
+					fileParams.size = parseLong(parts[1]);
+					break;
+				case 3:
+					fileParams.size = parseLong(parts[0]);
+					fileParams.width = parseInt(parts[1]);
+					fileParams.height = parseInt(parts[2]);
+					break;
+			}
 		}
-		return params;
+		return fileParams;
 	}
 
-	public FileParams getLegacyFileParams() {
-		FileParams params = new FileParams();
-		if (body == null) {
-			return params;
+	private static long parseLong(String value) {
+		try {
+			return Long.parseLong(value);
+		} catch (NumberFormatException e) {
+			return 0;
 		}
-		String parts[] = body.split(",");
-		if (parts.length == 3) {
-			try {
-				params.size = Long.parseLong(parts[0]);
-			} catch (NumberFormatException e) {
-				return null;
-			}
-			try {
-				params.width = Integer.parseInt(parts[1]);
-			} catch (NumberFormatException e) {
-				return null;
-			}
-			try {
-				params.height = Integer.parseInt(parts[2]);
-			} catch (NumberFormatException e) {
-				return null;
-			}
-			return params;
-		} else {
+	}
+
+	private static int parseInt(String value) {
+		try {
+			return Integer.parseInt(value);
+		} catch (NumberFormatException e) {
+			return 0;
+		}
+	}
+
+	private static URL parseUrl(String value) {
+		try {
+			return new URL(value);
+		} catch (MalformedURLException e) {
 			return null;
 		}
 	}
@@ -754,8 +859,12 @@ public class Message extends AbstractEntity {
 		this.mPreviousMessage = null;
 	}
 
+	public boolean isPrivateMessage() {
+		return type == TYPE_PRIVATE || type == TYPE_PRIVATE_FILE;
+	}
+
 	public boolean isFileOrImage() {
-		return type == TYPE_FILE || type == TYPE_IMAGE;
+		return type == TYPE_FILE || type == TYPE_IMAGE || type == TYPE_PRIVATE_FILE;
 	}
 
 	public boolean hasFileOnRemoteHost() {
@@ -771,24 +880,25 @@ public class Message extends AbstractEntity {
 		public long size = 0;
 		public int width = 0;
 		public int height = 0;
+		public int runtime = 0;
 	}
 
-	public void setAxolotlFingerprint(String fingerprint) {
+	public void setFingerprint(String fingerprint) {
 		this.axolotlFingerprint = fingerprint;
 	}
 
-	public String getAxolotlFingerprint() {
+	public String getFingerprint() {
 		return axolotlFingerprint;
 	}
 
 	public boolean isTrusted() {
-		XmppAxolotlSession.Trust t = conversation.getAccount().getAxolotlService().getFingerprintTrust(axolotlFingerprint);
-		return t != null && t.trusted();
+		FingerprintStatus s = conversation.getAccount().getAxolotlService().getFingerprintTrust(axolotlFingerprint);
+		return s != null && s.isTrusted();
 	}
 
-	private  int getPreviousEncryption() {
-		for (Message iterator = this.prev(); iterator != null; iterator = iterator.prev()){
-			if( iterator.isCarbon() || iterator.getStatus() == STATUS_RECEIVED ) {
+	private int getPreviousEncryption() {
+		for (Message iterator = this.prev(); iterator != null; iterator = iterator.prev()) {
+			if (iterator.isCarbon() || iterator.getStatus() == STATUS_RECEIVED) {
 				continue;
 			}
 			return iterator.getEncryption();
@@ -797,13 +907,18 @@ public class Message extends AbstractEntity {
 	}
 
 	private int getNextEncryption() {
-		for (Message iterator = this.next(); iterator != null; iterator = iterator.next()){
-			if( iterator.isCarbon() || iterator.getStatus() == STATUS_RECEIVED ) {
-				continue;
+		if (this.conversation instanceof Conversation) {
+			Conversation conversation = (Conversation) this.conversation;
+			for (Message iterator = this.next(); iterator != null; iterator = iterator.next()) {
+				if (iterator.isCarbon() || iterator.getStatus() == STATUS_RECEIVED) {
+					continue;
+				}
+				return iterator.getEncryption();
 			}
-			return iterator.getEncryption();
+			return conversation.getNextEncryption();
+		} else {
+			throw new AssertionError("This should never be called since isInValidSession should be disabled for stubs");
 		}
-		return conversation.getNextEncryption();
 	}
 
 	public boolean isValidInSession() {
@@ -821,6 +936,36 @@ public class Message extends AbstractEntity {
 		if (encryption == ENCRYPTION_DECRYPTED || encryption == ENCRYPTION_DECRYPTION_FAILED) {
 			return ENCRYPTION_PGP;
 		}
+		if (encryption == ENCRYPTION_AXOLOTL_NOT_FOR_THIS_DEVICE || encryption == ENCRYPTION_AXOLOTL_FAILED) {
+			return ENCRYPTION_AXOLOTL;
+		}
 		return encryption;
+	}
+
+	public static boolean configurePrivateMessage(final Message message) {
+		return configurePrivateMessage(message, false);
+	}
+
+	public static boolean configurePrivateFileMessage(final Message message) {
+		return configurePrivateMessage(message, true);
+	}
+
+	private static boolean configurePrivateMessage(final Message message, final boolean isFile) {
+		final Conversation conversation;
+		if (message.conversation instanceof Conversation) {
+			conversation = (Conversation) message.conversation;
+		} else {
+			return false;
+		}
+		if (conversation.getMode() == Conversation.MODE_MULTI) {
+			final Jid nextCounterpart = conversation.getNextCounterpart();
+			if (nextCounterpart != null) {
+				message.setCounterpart(nextCounterpart);
+				message.setTrueCounterpart(conversation.getMucOptions().getTrueCounterpart(nextCounterpart));
+				message.setType(isFile ? Message.TYPE_PRIVATE_FILE : Message.TYPE_PRIVATE);
+				return true;
+			}
+		}
+		return false;
 	}
 }

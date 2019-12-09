@@ -1,73 +1,107 @@
 package eu.siacs.conversations.ui.adapter;
 
-import android.content.Context;
+import android.content.res.Resources;
+import android.databinding.DataBindingUtil;
+import android.graphics.Bitmap;
+import android.graphics.drawable.BitmapDrawable;
+import android.graphics.drawable.Drawable;
+import android.os.AsyncTask;
+import android.support.annotation.NonNull;
 import android.view.LayoutInflater;
 import android.view.View;
 import android.view.ViewGroup;
 import android.widget.ArrayAdapter;
-import android.widget.CompoundButton;
 import android.widget.ImageView;
-import android.widget.TextView;
 
+import java.lang.ref.WeakReference;
 import java.util.List;
+import java.util.concurrent.RejectedExecutionException;
 
 import eu.siacs.conversations.Config;
 import eu.siacs.conversations.R;
+import eu.siacs.conversations.databinding.AccountRowBinding;
 import eu.siacs.conversations.entities.Account;
-import eu.siacs.conversations.ui.ManageAccountActivity;
 import eu.siacs.conversations.ui.XmppActivity;
-import eu.siacs.conversations.ui.widget.Switch;
+import eu.siacs.conversations.ui.util.AvatarWorkerTask;
+import eu.siacs.conversations.ui.util.StyledAttributes;
+import eu.siacs.conversations.utils.UIHelper;
 
 public class AccountAdapter extends ArrayAdapter<Account> {
 
-	private XmppActivity activity;
+    private XmppActivity activity;
+    private boolean showStateButton;
 
-	public AccountAdapter(XmppActivity activity, List<Account> objects) {
-		super(activity, 0, objects);
-		this.activity = activity;
-	}
+    public AccountAdapter(XmppActivity activity, List<Account> objects, boolean showStateButton) {
+        super(activity, 0, objects);
+        this.activity = activity;
+        this.showStateButton = showStateButton;
+    }
 
-	@Override
-	public View getView(int position, View view, ViewGroup parent) {
-		final Account account = getItem(position);
-		if (view == null) {
-			LayoutInflater inflater = (LayoutInflater) getContext()
-					.getSystemService(Context.LAYOUT_INFLATER_SERVICE);
-			view = inflater.inflate(R.layout.account_row, parent, false);
-		}
-		TextView jid = (TextView) view.findViewById(R.id.account_jid);
-		if (Config.DOMAIN_LOCK != null) {
-			jid.setText(account.getJid().getLocalpart());
-		} else {
-			jid.setText(account.getJid().toBareJid().toString());
-		}
-		TextView statusView = (TextView) view.findViewById(R.id.account_status);
-		ImageView imageView = (ImageView) view.findViewById(R.id.account_image);
-		imageView.setImageBitmap(activity.avatarService().get(account, activity.getPixel(48)));
-		statusView.setText(getContext().getString(account.getStatus().getReadableId()));
-		switch (account.getStatus()) {
-			case ONLINE:
-				statusView.setTextColor(activity.getOnlineColor());
-				break;
-			case DISABLED:
-			case CONNECTING:
-				statusView.setTextColor(activity.getSecondaryTextColor());
-				break;
-			default:
-				statusView.setTextColor(activity.getWarningTextColor());
-				break;
-		}
-		final Switch tglAccountState = (Switch) view.findViewById(R.id.tgl_account_status);
-		final boolean isDisabled = (account.getStatus() == Account.State.DISABLED);
-		tglAccountState.setChecked(!isDisabled,false);
-		tglAccountState.setOnCheckedChangeListener(new CompoundButton.OnCheckedChangeListener() {
-			@Override
-			public void onCheckedChanged(CompoundButton compoundButton, boolean b) {
-				if (b == isDisabled && activity instanceof ManageAccountActivity) {
-					((ManageAccountActivity) activity).onClickTglAccountState(account,b);
-				}
-			}
-		});
-		return view;
-	}
+    public AccountAdapter(XmppActivity activity, List<Account> objects) {
+        super(activity, 0, objects);
+        this.activity = activity;
+        this.showStateButton = true;
+    }
+
+    @Override
+    public View getView(int position, View view, @NonNull ViewGroup parent) {
+        final Account account = getItem(position);
+        final ViewHolder viewHolder;
+        if (view == null) {
+            AccountRowBinding binding = DataBindingUtil.inflate(LayoutInflater.from(parent.getContext()), R.layout.account_row, parent, false);
+            view = binding.getRoot();
+            viewHolder = new ViewHolder(binding);
+            view.setTag(viewHolder);
+        } else {
+            viewHolder = (ViewHolder) view.getTag();
+        }
+        if (Config.DOMAIN_LOCK != null) {
+            viewHolder.binding.accountJid.setText(account.getJid().getLocal());
+        } else {
+            viewHolder.binding.accountJid.setText(account.getJid().asBareJid().toString());
+        }
+        AvatarWorkerTask.loadAvatar(account, viewHolder.binding.accountImage, R.dimen.avatar);
+        viewHolder.binding.accountStatus.setText(getContext().getString(account.getStatus().getReadableId()));
+        switch (account.getStatus()) {
+            case ONLINE:
+                viewHolder.binding.accountStatus.setTextColor(StyledAttributes.getColor(activity, R.attr.TextColorOnline));
+                break;
+            case DISABLED:
+            case CONNECTING:
+                viewHolder.binding.accountStatus.setTextColor(StyledAttributes.getColor(activity, android.R.attr.textColorSecondary));
+                break;
+            default:
+                viewHolder.binding.accountStatus.setTextColor(StyledAttributes.getColor(activity, R.attr.TextColorError));
+                break;
+        }
+        final boolean isDisabled = (account.getStatus() == Account.State.DISABLED);
+        viewHolder.binding.tglAccountStatus.setOnCheckedChangeListener(null);
+        viewHolder.binding.tglAccountStatus.setChecked(!isDisabled);
+        if (this.showStateButton) {
+            viewHolder.binding.tglAccountStatus.setVisibility(View.VISIBLE);
+        } else {
+            viewHolder.binding.tglAccountStatus.setVisibility(View.GONE);
+        }
+        viewHolder.binding.tglAccountStatus.setOnCheckedChangeListener((compoundButton, b) -> {
+            if (b == isDisabled && activity instanceof OnTglAccountState) {
+                ((OnTglAccountState) activity).onClickTglAccountState(account, b);
+            }
+        });
+        return view;
+    }
+
+    private static class ViewHolder {
+        private final AccountRowBinding binding;
+
+        private ViewHolder(AccountRowBinding binding) {
+            this.binding = binding;
+        }
+    }
+
+
+
+    public interface OnTglAccountState {
+        void onClickTglAccountState(Account account, boolean state);
+    }
+
 }
